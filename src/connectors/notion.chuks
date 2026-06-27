@@ -56,9 +56,9 @@ export class NotionConnector {
         out.push({
             "name": "notion_search",
             "scope": "read",
-            "description": "Search Notion pages and databases by text.",
+            "description": "Search Notion. Notion matches against page and database TITLES (full-text), not body content. Use a keyword likely to appear in a title, or pass an empty string to list every page/database the integration can access. Prefer an empty query when asked to summarize or list the workspace.",
             "params": {
-                "query": { "type": "string", "description": "Search text", "required": true },
+                "query": { "type": "string", "description": "A keyword that appears in a page/database title, or \"\" (empty) to list all accessible pages.", "required": true },
                 "limit": { "type": "int", "description": "How many results", "default": 10 },
             },
             "fn": function(args: any): any {
