@@ -1,0 +1,254 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Microsoft 365 connectors — Outlook, Teams, and OneDrive over the Microsoft
+//  Graph API (https://graph.microsoft.com/v1.0). All three authenticate the same
+//  way: an OAuth access token plus an optional `refresh` callback (fn(): string),
+//  refreshed transparently on a 401. Run the authorization-code flow with
+//  `chuks_oauth` against the Microsoft identity platform, then hand the token here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { HttpTransport, oauthToken, OAuthOptions, TransportOptions, ToolConfig, orInt } from "../core.chuks"
+
+export dataType MsQuery {
+    limit: int?        // page size (Graph $top)
+    unread: bool?      // Outlook only: unread filter
+}
+
+// Build a Graph transport with OAuth (+ optional refresh).
+function _graphTransport(accessToken: string, refresh: any, ua: string): HttpTransport {
+    var cred: any = null
+    if (refresh != null) {
+        var o: OAuthOptions = { "refresh": refresh }
+        cred = oauthToken(accessToken, o)
+    } else {
+        cred = oauthToken(accessToken, null)
+    }
+    var topts: TransportOptions = { "userAgent": ua }
+    return new HttpTransport("https://graph.microsoft.com/v1.0", cred, topts)
+}
+
+function _msLimit(q: MsQuery?): int? {
+    if (q == null) { return null }
+    return q.limit
+}
+function _msUnread(q: MsQuery?): bool {
+    if (q == null) { return false }
+    if (q.unread == true) { return true }
+    return false
+}
+
+// Safely extract a Graph message's sender address.
+function _msFrom(m: any): string {
+    var f: any = m["from"]
+    if (f == null) { return "" }
+    var ea: any = f["emailAddress"]
+    if (ea == null) { return "" }
+    var a: any = ea["address"]
+    if (a == null) { return "" }
+    return string(a)
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Outlook (mail) ─────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+export class OutlookConnector {
+    var _t: HttpTransport? = null
+
+    constructor(accessToken: string, refresh: any) {
+        this._t = _graphTransport(accessToken, refresh, "chuks_connector-outlook")
+    }
+    private _http(): HttpTransport {
+        var t: HttpTransport? = this._t
+        if (t == null) { throw "outlook connector: transport not initialized" }
+        return t
+    }
+
+    // List inbox messages, enriched with From / Subject / preview.
+    public async inbox(q: MsQuery?): Task<any> {
+        var top: int = orInt(_msLimit(q), 10)
+        var path: string = "/me/messages?$top=" + string(top) + "&$select=subject,from,bodyPreview,isRead"
+        if (_msUnread(q)) { path = path + "&$filter=isRead%20eq%20false" }
+        var d: any = await this._http().getJson(path, null)
+        var msgs: any = d["value"]
+        var out: []any = []
+        if (msgs == null) { return out }
+        for (var m of msgs) {
+            out.push({
+                "id": m["id"],
+                "from": _msFrom(m),
+                "subject": m["subject"],
+                "snippet": m["bodyPreview"],
+            })
+        }
+        return out
+    }
+
+    // Send a plain-text email.
+    public async send(to: string, subject: string, body: string): Task<any> {
+        var message: any = {
+            "subject": subject,
+            "body": { "contentType": "Text", "content": body },
+            "toRecipients": [ { "emailAddress": { "address": to } } ],
+        }
+        return await this._http().postJson("/me/sendMail", { "message": message, "saveToSentItems": true }, null)
+    }
+
+    public asTool(): []ToolConfig {
+        var self: OutlookConnector = this
+        var out: []ToolConfig = []
+        out.push({
+            "name": "outlook_inbox",
+            "scope": "read",
+            "description": "List Outlook inbox messages (From, Subject, preview).",
+            "params": {
+                "maxResults": { "type": "int", "description": "How many messages", "default": 10 },
+                "unread": { "type": "bool", "description": "Only unread", "default": false },
+            },
+            "fn": function(args: any): any {
+                var q: MsQuery = { "limit": args["maxResults"], "unread": args["unread"] }
+                return self.inbox(q)
+            },
+        })
+        out.push({
+            "name": "outlook_send",
+            "scope": "write",
+            "description": "Send a plain-text email via Outlook.",
+            "params": {
+                "to": { "type": "string", "description": "Recipient address", "required": true },
+                "subject": { "type": "string", "description": "Subject", "required": true },
+                "body": { "type": "string", "description": "Body (plain text)", "required": true },
+            },
+            "fn": function(args: any): any {
+                return self.send(args["to"], args["subject"], args["body"])
+            },
+        })
+        return out
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Teams ──────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+export class TeamsConnector {
+    var _t: HttpTransport? = null
+
+    constructor(accessToken: string, refresh: any) {
+        this._t = _graphTransport(accessToken, refresh, "chuks_connector-teams")
+    }
+    private _http(): HttpTransport {
+        var t: HttpTransport? = this._t
+        if (t == null) { throw "teams connector: transport not initialized" }
+        return t
+    }
+
+    // Post a message to a channel.
+    public async send(teamId: string, channelId: string, content: string): Task<any> {
+        var path: string = "/teams/" + teamId + "/channels/" + channelId + "/messages"
+        return await this._http().postJson(path, { "body": { "content": content } }, null)
+    }
+
+    // Read recent channel messages.
+    public async messages(teamId: string, channelId: string, q: MsQuery?): Task<any> {
+        var top: int = orInt(_msLimit(q), 20)
+        var path: string = "/teams/" + teamId + "/channels/" + channelId + "/messages?$top=" + string(top)
+        var d: any = await this._http().getJson(path, null)
+        return d["value"]
+    }
+
+    public asTool(): []ToolConfig {
+        var self: TeamsConnector = this
+        var out: []ToolConfig = []
+        out.push({
+            "name": "teams_send",
+            "scope": "write",
+            "description": "Post a message to a Microsoft Teams channel.",
+            "params": {
+                "teamId": { "type": "string", "description": "Team id", "required": true },
+                "channelId": { "type": "string", "description": "Channel id", "required": true },
+                "content": { "type": "string", "description": "Message content", "required": true },
+            },
+            "fn": function(args: any): any {
+                return self.send(args["teamId"], args["channelId"], args["content"])
+            },
+        })
+        out.push({
+            "name": "teams_messages",
+            "scope": "read",
+            "description": "Read recent messages in a Microsoft Teams channel.",
+            "params": {
+                "teamId": { "type": "string", "description": "Team id", "required": true },
+                "channelId": { "type": "string", "description": "Channel id", "required": true },
+                "limit": { "type": "int", "description": "How many messages", "default": 20 },
+            },
+            "fn": function(args: any): any {
+                var q: MsQuery = { "limit": args["limit"] }
+                return self.messages(args["teamId"], args["channelId"], q)
+            },
+        })
+        return out
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── OneDrive ───────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+export class OneDriveConnector {
+    var _t: HttpTransport? = null
+
+    constructor(accessToken: string, refresh: any) {
+        this._t = _graphTransport(accessToken, refresh, "chuks_connector-onedrive")
+    }
+    private _http(): HttpTransport {
+        var t: HttpTransport? = this._t
+        if (t == null) { throw "onedrive connector: transport not initialized" }
+        return t
+    }
+
+    // List items in the drive root.
+    public async files(q: MsQuery?): Task<any> {
+        var top: int = orInt(_msLimit(q), 20)
+        var d: any = await this._http().getJson("/me/drive/root/children?$top=" + string(top), null)
+        return d["value"]
+    }
+
+    // Create a folder in the drive root.
+    public async createFolder(name: string): Task<any> {
+        var body: any = {
+            "name": name,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "rename",
+        }
+        return await this._http().postJson("/me/drive/root/children", body, null)
+    }
+
+    public asTool(): []ToolConfig {
+        var self: OneDriveConnector = this
+        var out: []ToolConfig = []
+        out.push({
+            "name": "onedrive_files",
+            "scope": "read",
+            "description": "List files and folders in the OneDrive root.",
+            "params": {
+                "limit": { "type": "int", "description": "How many items", "default": 20 },
+            },
+            "fn": function(args: any): any {
+                var q: MsQuery = { "limit": args["limit"] }
+                return self.files(q)
+            },
+        })
+        out.push({
+            "name": "onedrive_create_folder",
+            "scope": "write",
+            "description": "Create a folder in the OneDrive root.",
+            "params": {
+                "name": { "type": "string", "description": "Folder name", "required": true },
+            },
+            "fn": function(args: any): any {
+                return self.createFolder(args["name"])
+            },
+        })
+        return out
+    }
+}

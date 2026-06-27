@@ -1,0 +1,12 @@
+{
+  "name": "@chuks/connector",
+  "version": "0.1.0",
+  "description": "Pre-built, typed, authenticated connectors to external services for Chuks — auth handled, API wrapped, agent-ready via asTool(). In-process, single-binary, no separate server.",
+  "entry": "src/index.chuks",
+  "author": "Chuks Team",
+  "license": "MIT",
+  "keywords": ["connectors", "integrations", "oauth", "api", "agent", "tools", "github", "slack", "gmail", "automation"],
+  "repository": "https://github.com/chuks-lang/chuks_connector",
+  "declaredDomains": ["api.github.com", "slack.com", "api.linear.app", "api.notion.com", "www.googleapis.com", "gmail.googleapis.com", "discord.com", "api.stripe.com", "api.twilio.com", "graph.microsoft.com"],
+  "dependencies": {}
+}

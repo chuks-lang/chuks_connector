@@ -1,0 +1,84 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Twilio connector — send and list SMS via the Twilio REST API.
+//  Authenticate with an Account SID + Auth Token (HTTP Basic). Twilio expects
+//  form-encoded bodies, handled by the transport's `postFormData`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { HttpTransport, basic, TransportOptions, ToolConfig, orInt } from "../core.chuks"
+
+export dataType TwilioQuery {
+    limit: int?        // how many messages (default 20)
+}
+
+export class TwilioConnector {
+    var _t: HttpTransport? = null
+    var _sid: string = ""
+
+    constructor(accountSid: string, authToken: string) {
+        this._sid = accountSid
+        var topts: TransportOptions = { "userAgent": "chuks_connector-twilio" }
+        this._t = new HttpTransport("https://api.twilio.com", basic(accountSid, authToken), topts)
+    }
+
+    private _http(): HttpTransport {
+        var t: HttpTransport? = this._t
+        if (t == null) { throw "twilio connector: transport not initialized" }
+        return t
+    }
+
+    private _base(): string {
+        return "/2010-04-01/Accounts/" + this._sid + "/Messages.json"
+    }
+
+    // Send an SMS.
+    public async sendSms(fromNumber: string, to: string, body: string): Task<any> {
+        var fields: map[string]string = { "From": fromNumber, "To": to, "Body": body }
+        return await this._http().postFormData(this._base(), fields, null)
+    }
+
+    // List recent messages.
+    public async messages(q: TwilioQuery?): Task<any> {
+        var limit: int = orInt(_twLimit(q), 20)
+        var d: any = await this._http().getJson(this._base() + "?PageSize=" + string(limit), null)
+        return d["messages"]
+    }
+
+    public asTool(): []ToolConfig {
+        var self: TwilioConnector = this
+        var out: []ToolConfig = []
+
+        out.push({
+            "name": "twilio_send_sms",
+            "scope": "write",
+            "description": "Send an SMS message via Twilio.",
+            "params": {
+                "from": { "type": "string", "description": "Sender phone number (E.164)", "required": true },
+                "to": { "type": "string", "description": "Recipient phone number (E.164)", "required": true },
+                "body": { "type": "string", "description": "Message text", "required": true },
+            },
+            "fn": function(args: any): any {
+                return self.sendSms(args["from"], args["to"], args["body"])
+            },
+        })
+
+        out.push({
+            "name": "twilio_messages",
+            "scope": "read",
+            "description": "List recent Twilio SMS messages.",
+            "params": {
+                "limit": { "type": "int", "description": "How many messages", "default": 20 },
+            },
+            "fn": function(args: any): any {
+                var q: TwilioQuery = { "limit": args["limit"] }
+                return self.messages(q)
+            },
+        })
+
+        return out
+    }
+}
+
+function _twLimit(q: TwilioQuery?): int? {
+    if (q == null) { return null }
+    return q.limit
+}

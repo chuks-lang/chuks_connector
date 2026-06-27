@@ -1,0 +1,125 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Gmail connector — typed operations over the Gmail v1 API.
+//  OAuth like Google Calendar: pass an access token and an optional `refresh`
+//  callback (fn(): string). `inbox` enriches each message with From/Subject/
+//  snippet; `send` builds an RFC822 message and base64url-encodes it (the form
+//  Gmail's send endpoint expects).
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { HttpTransport, oauthToken, OAuthOptions, TransportOptions, ToolConfig, orInt } from "../core.chuks"
+import { base64 } from "std/base64"
+
+export dataType GmailQuery {
+    maxResults: int?   // how many messages (default 10)
+    unread: bool?      // only unread (default false)
+}
+
+export class GmailConnector {
+    var _t: HttpTransport? = null
+
+    constructor(accessToken: string, refresh: any) {
+        var cred: any = null
+        if (refresh != null) {
+            var oauthOpts: OAuthOptions = { "refresh": refresh }
+            cred = oauthToken(accessToken, oauthOpts)
+        } else {
+            cred = oauthToken(accessToken, null)
+        }
+        var topts: TransportOptions = { "userAgent": "chuks_connector-gmail" }
+        this._t = new HttpTransport("https://gmail.googleapis.com", cred, topts)
+    }
+
+    private _http(): HttpTransport {
+        var t: HttpTransport? = this._t
+        if (t == null) { throw "gmail connector: transport not initialized" }
+        return t
+    }
+
+    // List recent inbox messages, each enriched with From / Subject / snippet.
+    public async inbox(q: GmailQuery?): Task<any> {
+        var maxR: int = orInt(_gMax(q), 10)
+        var path: string = "/gmail/v1/users/me/messages?maxResults=" + string(maxR)
+        if (_gUnread(q)) { path = path + "&q=is:unread" }
+
+        var listing: any = await this._http().getJson(path, null)
+        var msgs: any = listing["messages"]
+        var out: []any = []
+        if (msgs == null) { return out }
+
+        for (var m of msgs) {
+            var id: string = string(m["id"])
+            var detail: any = await this._http().getJson("/gmail/v1/users/me/messages/" + id + "?format=metadata&metadataHeaders=From&metadataHeaders=Subject", null)
+            var headers: any = null
+            var payload: any = detail["payload"]
+            if (payload != null) { headers = payload["headers"] }
+            out.push({
+                "id": id,
+                "from": _header(headers, "From"),
+                "subject": _header(headers, "Subject"),
+                "snippet": string(detail["snippet"]),
+            })
+        }
+        return out
+    }
+
+    // Send a plain-text email.
+    public async send(to: string, subject: string, body: string): Task<any> {
+        var mime: string = "To: " + to + "\r\nSubject: " + subject + "\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + body
+        var raw: string = base64.urlEncode(mime)
+        return await this._http().postJson("/gmail/v1/users/me/messages/send", { "raw": raw }, null)
+    }
+
+    public asTool(): []ToolConfig {
+        var self: GmailConnector = this
+        var out: []ToolConfig = []
+
+        out.push({
+            "name": "gmail_inbox",
+            "scope": "read",
+            "description": "List recent inbox messages (From, Subject, snippet).",
+            "params": {
+                "maxResults": { "type": "int", "description": "How many messages", "default": 10 },
+                "unread": { "type": "bool", "description": "Only unread messages", "default": false },
+            },
+            "fn": function(args: any): any {
+                var q: GmailQuery = { "maxResults": args["maxResults"], "unread": args["unread"] }
+                return self.inbox(q)
+            },
+        })
+
+        out.push({
+            "name": "gmail_send",
+            "scope": "write",
+            "description": "Send a plain-text email.",
+            "params": {
+                "to": { "type": "string", "description": "Recipient address", "required": true },
+                "subject": { "type": "string", "description": "Subject line", "required": true },
+                "body": { "type": "string", "description": "Message body (plain text)", "required": true },
+            },
+            "fn": function(args: any): any {
+                return self.send(args["to"], args["subject"], args["body"])
+            },
+        })
+
+        return out
+    }
+}
+
+// Find a header value by name in Gmail's [{name, value}] header array.
+function _header(headers: any, name: string): string {
+    if (headers == null) { return "" }
+    for (var h of headers) {
+        if (h["name"] == name) { return string(h["value"]) }
+    }
+    return ""
+}
+
+function _gMax(q: GmailQuery?): int? {
+    if (q == null) { return null }
+    return q.maxResults
+}
+function _gUnread(q: GmailQuery?): bool {
+    if (q == null) { return false }
+    if (q.unread == true) { return true }
+    return false
+}

@@ -1,0 +1,113 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Jira connector — typed operations over the Jira Cloud REST API (v3).
+//  Authenticate with your account email + an API token (HTTP Basic). Pass your
+//  site base URL, e.g. "https://your-company.atlassian.net".
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { HttpTransport, basic, TransportOptions, ToolConfig, orInt } from "../core.chuks"
+import { url } from "std/url"
+
+export dataType JiraQuery {
+    limit: int?        // how many issues (default 25)
+}
+
+export class JiraConnector {
+    var _t: HttpTransport? = null
+
+    constructor(siteUrl: string, email: string, apiToken: string) {
+        var topts: TransportOptions = { "userAgent": "chuks_connector-jira" }
+        this._t = new HttpTransport(siteUrl, basic(email, apiToken), topts)
+    }
+
+    private _http(): HttpTransport {
+        var t: HttpTransport? = this._t
+        if (t == null) { throw "jira connector: transport not initialized" }
+        return t
+    }
+
+    // Search issues with a JQL query, e.g. "project = ENG AND status = 'To Do'".
+    public async searchIssues(jql: string, q: JiraQuery?): Task<any> {
+        var limit: int = orInt(_jLimit(q), 25)
+        var path: string = "/rest/api/3/search?jql=" + url.encode(jql) + "&maxResults=" + string(limit)
+        var d: any = await this._http().getJson(path, null)
+        return d["issues"]
+    }
+
+    // Create an issue in a project.
+    public async createIssue(projectKey: string, summary: string, issueType: string): Task<any> {
+        var fields: any = {
+            "project": { "key": projectKey },
+            "summary": summary,
+            "issuetype": { "name": issueType },
+        }
+        return await this._http().postJson("/rest/api/3/issue", { "fields": fields }, null)
+    }
+
+    // Comment on an issue. Jira comments use the Atlassian Document Format (ADF),
+    // wrapped here so callers pass plain text.
+    public async comment(issueKey: string, text: string): Task<any> {
+        var adf: any = {
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    { "type": "paragraph", "content": [ { "type": "text", "text": text } ] },
+                ],
+            },
+        }
+        return await this._http().postJson("/rest/api/3/issue/" + issueKey + "/comment", adf, null)
+    }
+
+    public asTool(): []ToolConfig {
+        var self: JiraConnector = this
+        var out: []ToolConfig = []
+
+        out.push({
+            "name": "jira_search",
+            "scope": "read",
+            "description": "Search Jira issues with a JQL query.",
+            "params": {
+                "jql": { "type": "string", "description": "JQL, e.g. project = ENG AND status = 'To Do'", "required": true },
+                "limit": { "type": "int", "description": "How many issues", "default": 25 },
+            },
+            "fn": function(args: any): any {
+                var q: JiraQuery = { "limit": args["limit"] }
+                return self.searchIssues(args["jql"], q)
+            },
+        })
+
+        out.push({
+            "name": "jira_create_issue",
+            "scope": "write",
+            "description": "Create a Jira issue in a project.",
+            "params": {
+                "projectKey": { "type": "string", "description": "Project key, e.g. ENG", "required": true },
+                "summary": { "type": "string", "description": "Issue summary", "required": true },
+                "issueType": { "type": "string", "description": "Issue type, e.g. Task or Bug", "required": true },
+            },
+            "fn": function(args: any): any {
+                return self.createIssue(args["projectKey"], args["summary"], args["issueType"])
+            },
+        })
+
+        out.push({
+            "name": "jira_comment",
+            "scope": "write",
+            "description": "Comment on a Jira issue.",
+            "params": {
+                "issueKey": { "type": "string", "description": "Issue key, e.g. ENG-123", "required": true },
+                "text": { "type": "string", "description": "Comment text", "required": true },
+            },
+            "fn": function(args: any): any {
+                return self.comment(args["issueKey"], args["text"])
+            },
+        })
+
+        return out
+    }
+}
+
+function _jLimit(q: JiraQuery?): int? {
+    if (q == null) { return null }
+    return q.limit
+}

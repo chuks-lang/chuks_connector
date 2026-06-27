@@ -1,0 +1,102 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Stripe connector — typed operations over the Stripe API.
+//  Authenticate with a secret key (bearer). Stripe expects form-encoded request
+//  bodies, not JSON, so writes go through the transport's `postFormData`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { HttpTransport, bearer, TransportOptions, ToolConfig, orInt } from "../core.chuks"
+
+export dataType StripeQuery {
+    limit: int?        // page size (default 10)
+}
+
+export class StripeConnector {
+    var _t: HttpTransport? = null
+
+    constructor(secretKey: string) {
+        var topts: TransportOptions = { "userAgent": "chuks_connector-stripe" }
+        this._t = new HttpTransport("https://api.stripe.com", bearer(secretKey), topts)
+    }
+
+    private _http(): HttpTransport {
+        var t: HttpTransport? = this._t
+        if (t == null) { throw "stripe connector: transport not initialized" }
+        return t
+    }
+
+    // List customers.
+    public async customers(q: StripeQuery?): Task<any> {
+        var limit: int = orInt(_stLimit(q), 10)
+        var d: any = await this._http().getJson("/v1/customers?limit=" + string(limit), null)
+        return d["data"]
+    }
+
+    // Create a customer (form-encoded body).
+    public async createCustomer(email: string, name: string): Task<any> {
+        var fields: map[string]string = { "email": email, "name": name }
+        return await this._http().postFormData("/v1/customers", fields, null)
+    }
+
+    // List invoices, optionally for one customer.
+    public async invoices(customerId: string, q: StripeQuery?): Task<any> {
+        var limit: int = orInt(_stLimit(q), 10)
+        var path: string = "/v1/invoices?limit=" + string(limit)
+        if (customerId != "") { path = path + "&customer=" + customerId }
+        var d: any = await this._http().getJson(path, null)
+        return d["data"]
+    }
+
+    public asTool(): []ToolConfig {
+        var self: StripeConnector = this
+        var out: []ToolConfig = []
+
+        out.push({
+            "name": "stripe_customers",
+            "scope": "read",
+            "description": "List Stripe customers.",
+            "params": {
+                "limit": { "type": "int", "description": "How many customers", "default": 10 },
+            },
+            "fn": function(args: any): any {
+                var q: StripeQuery = { "limit": args["limit"] }
+                return self.customers(q)
+            },
+        })
+
+        out.push({
+            "name": "stripe_invoices",
+            "scope": "read",
+            "description": "List Stripe invoices, optionally filtered by customer id.",
+            "params": {
+                "customerId": { "type": "string", "description": "Customer id (optional)", "default": "" },
+                "limit": { "type": "int", "description": "How many invoices", "default": 10 },
+            },
+            "fn": function(args: any): any {
+                var cust: any = args["customerId"]
+                if (cust == null) { cust = "" }
+                var q: StripeQuery = { "limit": args["limit"] }
+                return self.invoices(string(cust), q)
+            },
+        })
+
+        out.push({
+            "name": "stripe_create_customer",
+            "scope": "write",
+            "description": "Create a Stripe customer.",
+            "params": {
+                "email": { "type": "string", "description": "Customer email", "required": true },
+                "name": { "type": "string", "description": "Customer name", "required": true },
+            },
+            "fn": function(args: any): any {
+                return self.createCustomer(args["email"], args["name"])
+            },
+        })
+
+        return out
+    }
+}
+
+function _stLimit(q: StripeQuery?): int? {
+    if (q == null) { return null }
+    return q.limit
+}

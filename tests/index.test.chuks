@@ -1,0 +1,293 @@
+import { test } from "std/test"
+import { connectors, asTools, selectTools, readOnlyTools, ToolSelect, Credential, HttpTransport, MemoryTokenStore, GitHubConnector, SlackConnector, LinearConnector, NotionConnector, GoogleCalendarConnector, GmailConnector, DiscordConnector, StripeConnector, TwilioConnector, JiraConnector, bearer, apiKey, oauthToken, basic } from "../src/index.chuks"
+import { base64 } from "std/base64"
+
+var passed: int = 0
+var failed: int = 0
+var failures: []string = []
+
+function pass(label: string): void {
+    passed = passed + 1
+    println("  PASS: " + label)
+}
+function fail(label: string, detail: string): void {
+    failed = failed + 1
+    failures.push("FAIL: " + label + " — " + detail)
+    println("  FAIL: " + label + " — " + detail)
+}
+
+// ─── Module + factories ─────────────────────────────────────────
+
+function testConnectorsExist(): void {
+    if (connectors != null) { pass("connectors module exists") }
+    else { fail("connectors module", "is null") }
+}
+
+// ─── Credentials ────────────────────────────────────────────────
+
+function testBearerHeader(): void {
+    var c: Credential = bearer("tok123")
+    var h: any = c.applyHeaders({})
+    if (h["Authorization"] == "Bearer tok123") { pass("bearer applies Authorization header") }
+    else { fail("bearer header", "got " + string(h["Authorization"])) }
+}
+
+function testApiKeyCustomHeader(): void {
+    var c: Credential = apiKey("k_live", { "header": "X-Api-Key", "prefix": "" })
+    var h: any = c.applyHeaders({})
+    if (h["X-Api-Key"] == "k_live") { pass("apiKey uses custom header + empty prefix") }
+    else { fail("apiKey custom header", "got " + string(h["X-Api-Key"])) }
+}
+
+function testApiKeyQuery(): void {
+    var c: Credential = apiKey("k_live", { "query": "api_key" })
+    var q: string = c.queryAuth()
+    var h: any = c.applyHeaders({})
+    var auth: any = h["Authorization"]
+    if (q == "api_key=k_live" && (auth == null || auth == "")) { pass("apiKey query-param auth, no header") }
+    else { fail("apiKey query", "q=" + q) }
+}
+
+function testOauthRefresh(): void {
+    var c: Credential = oauthToken("old", { "refresh": function(): any { return "new" } })
+    var ok: bool = c.refresh()
+    if (ok && c.token == "new") { pass("oauth refresh swaps the access token") }
+    else { fail("oauth refresh", "token=" + c.token) }
+}
+
+// ─── Token store ────────────────────────────────────────────────
+
+function testMemoryStore(): void {
+    var s: MemoryTokenStore = new MemoryTokenStore()
+    s.set("gmail", "abc")
+    if (s.get("gmail") == "abc" && s.get("missing") == null) { pass("MemoryTokenStore get/set") }
+    else { fail("MemoryTokenStore", "got " + string(s.get("gmail"))) }
+}
+
+// ─── asTool bridge ──────────────────────────────────────────────
+
+function testGithubAsTool(): void {
+    var gh: GitHubConnector = connectors.github("pat")
+    var t: any = gh.asTool()
+    if (length(t) == 4 && t[0]["name"] == "github_issues" && t[1]["name"] == "github_create_issue") {
+        pass("github.asTool() exposes 4 named tools")
+    } else {
+        fail("github asTool", "len=" + string(length(t)))
+    }
+}
+
+function testGithubToolSchema(): void {
+    var gh: GitHubConnector = connectors.github("pat")
+    var t: any = gh.asTool()
+    var first: any = t[0]
+    var params: any = first["params"]
+    var repo: any = params["repo"]
+    if (repo["required"] == true && first["fn"] != null) { pass("github tool carries typed params + fn") }
+    else { fail("github tool schema", "repo=" + string(repo)) }
+}
+
+function testSlackAsTool(): void {
+    var sl: SlackConnector = connectors.slack("xoxb")
+    var t: any = sl.asTool()
+    if (length(t) == 2 && t[0]["name"] == "slack_send") { pass("slack.asTool() exposes send + history") }
+    else { fail("slack asTool", "len=" + string(length(t))) }
+}
+
+function testAsToolsCombines(): void {
+    var gh: GitHubConnector = connectors.github("pat")
+    var sl: SlackConnector = connectors.slack("xoxb")
+    var combined: any = asTools([gh, sl])
+    if (length(combined) == 6) { pass("asTools([...]) flattens connector tools (4 + 2)") }
+    else { fail("asTools combine", "len=" + string(length(combined))) }
+}
+
+// ─── New connectors ─────────────────────────────────────────────
+
+function testLinearAsTool(): void {
+    var ln: LinearConnector = connectors.linear("lin_api_x")
+    var t: any = ln.asTool()
+    if (length(t) == 3 && t[0]["name"] == "linear_issues" && t[2]["name"] == "linear_create_issue") {
+        pass("linear.asTool() exposes issues/teams/create")
+    } else { fail("linear asTool", "len=" + string(length(t))) }
+}
+
+function testNotionAsTool(): void {
+    var no: NotionConnector = connectors.notion("secret_x")
+    var t: any = no.asTool()
+    if (length(t) == 3 && t[0]["name"] == "notion_search") { pass("notion.asTool() exposes search/page/database") }
+    else { fail("notion asTool", "len=" + string(length(t))) }
+}
+
+var refreshCalls: int = 0
+function fakeRefresh(): any { refreshCalls = refreshCalls + 1; return "fresh_token" }
+
+function testGoogleCalendarOAuth(): void {
+    // Construct with a refresh callback (the OAuth path), check tools + scopes.
+    var gc: GoogleCalendarConnector = connectors.googleCalendar("ya29.token", fakeRefresh)
+    var t: any = gc.asTool()
+    if (length(t) == 2 && t[0]["name"] == "gcal_list_events" && t[0]["scope"] == "read" && t[1]["scope"] == "write") {
+        pass("googleCalendar.asTool() exposes read list + write create")
+    } else { fail("gcal asTool", "len=" + string(length(t))) }
+}
+
+function testGmailAsTool(): void {
+    var gm: GmailConnector = connectors.gmail("ya29.token", null)
+    var t: any = gm.asTool()
+    if (length(t) == 2 && t[0]["name"] == "gmail_inbox" && t[0]["scope"] == "read" && t[1]["name"] == "gmail_send" && t[1]["scope"] == "write") {
+        pass("gmail.asTool() exposes read inbox + write send")
+    } else { fail("gmail asTool", "len=" + string(length(t))) }
+}
+
+function testDiscordAsTool(): void {
+    var dc: DiscordConnector = connectors.discord("bot_token")
+    var t: any = dc.asTool()
+    if (length(t) == 2 && t[0]["name"] == "discord_send" && t[0]["scope"] == "write" && t[1]["scope"] == "read") {
+        pass("discord.asTool() exposes send (write) + messages (read)")
+    } else { fail("discord asTool", "len=" + string(length(t))) }
+}
+
+function testStripeAsTool(): void {
+    var st: StripeConnector = connectors.stripe("sk_test_x")
+    var t: any = st.asTool()
+    if (length(t) == 3 && t[0]["name"] == "stripe_customers" && t[2]["name"] == "stripe_create_customer" && t[2]["scope"] == "write") {
+        pass("stripe.asTool() exposes customers/invoices/create")
+    } else { fail("stripe asTool", "len=" + string(length(t))) }
+}
+
+function testBasicAuth(): void {
+    var c: Credential = basic("user", "pass")
+    var h: any = c.applyHeaders({})
+    var expected: string = "Basic " + base64.encode("user:pass")
+    if (h["Authorization"] == expected) { pass("basic() builds HTTP Basic Authorization header") }
+    else { fail("basic auth", "got " + string(h["Authorization"])) }
+}
+
+function testTwilioAsTool(): void {
+    var tw: TwilioConnector = connectors.twilio("ACxxxx", "tok")
+    var t: any = tw.asTool()
+    if (length(t) == 2 && t[0]["name"] == "twilio_send_sms" && t[0]["scope"] == "write" && t[1]["scope"] == "read") {
+        pass("twilio.asTool() exposes send_sms (write) + messages (read)")
+    } else { fail("twilio asTool", "len=" + string(length(t))) }
+}
+
+function testJiraAsTool(): void {
+    var jr: JiraConnector = connectors.jira("https://x.atlassian.net", "e@x.com", "tok")
+    var t: any = jr.asTool()
+    if (length(t) == 3 && t[0]["name"] == "jira_search" && t[2]["name"] == "jira_comment" && t[2]["scope"] == "write") {
+        pass("jira.asTool() exposes search/create/comment")
+    } else { fail("jira asTool", "len=" + string(length(t))) }
+}
+
+function testMicrosoftAsTools(): void {
+    var ol: any = connectors.outlook("ms.token", null)
+    var tm: any = connectors.teams("ms.token", null)
+    var od: any = connectors.oneDrive("ms.token", null)
+    var olt: any = ol.asTool()
+    var tmt: any = tm.asTool()
+    var odt: any = od.asTool()
+    if (length(olt) == 2 && olt[0]["name"] == "outlook_inbox" &&
+        length(tmt) == 2 && tmt[0]["name"] == "teams_send" &&
+        length(odt) == 2 && odt[1]["name"] == "onedrive_create_folder") {
+        pass("microsoft (outlook/teams/onedrive) asTool surfaces")
+    } else {
+        fail("microsoft asTool", "ol=" + string(length(olt)) + " tm=" + string(length(tmt)) + " od=" + string(length(odt)))
+    }
+}
+
+function testOAuthCredentialRefreshWired(): void {
+    // The refresh callback handed to oauthToken is the one that fires on 401.
+    refreshCalls = 0
+    var c: Credential = oauthToken("old", { "refresh": fakeRefresh })
+    var ok: bool = c.refresh()
+    if (ok && c.token == "fresh_token" && refreshCalls == 1) { pass("oauth refresh callback is invoked + token rotated") }
+    else { fail("oauth wired", "calls=" + string(refreshCalls) + " token=" + c.token) }
+}
+
+// ─── Permission scopes ──────────────────────────────────────────
+
+function testScopesTagged(): void {
+    var gh: GitHubConnector = connectors.github("pat")
+    var t: any = gh.asTool()
+    // github_issues = read, github_create_issue = write
+    if (t[0]["scope"] == "read" && t[1]["scope"] == "write") { pass("tools are tagged read/write") }
+    else { fail("scopes", "issues=" + string(t[0]["scope"]) + " create=" + string(t[1]["scope"])) }
+}
+
+function testReadOnlyTools(): void {
+    var gh: GitHubConnector = connectors.github("pat")
+    var sl: SlackConnector = connectors.slack("xoxb")
+    var ro: any = readOnlyTools([gh, sl])
+    // GitHub: issues + pull_requests (2 read). Slack: history (1 read). Total 3.
+    var allWrite: bool = true
+    for (var tool of ro) { if (tool["scope"] != "read") { allWrite = false } }
+    if (length(ro) == 3 && allWrite) { pass("readOnlyTools keeps only read-scoped tools (3)") }
+    else { fail("readOnly", "len=" + string(length(ro))) }
+}
+
+function testSelectExclude(): void {
+    var gh: GitHubConnector = connectors.github("pat")
+    var sel: ToolSelect = { "exclude": ["github_create_issue", "github_comment"] }
+    var picked: any = selectTools([gh], sel)
+    if (length(picked) == 2) { pass("selectTools exclude drops named tools (4 - 2 = 2)") }
+    else { fail("select exclude", "len=" + string(length(picked))) }
+}
+
+// ─── Transport construction ─────────────────────────────────────
+
+function testTransportBuilds(): void {
+    var tr: HttpTransport = new HttpTransport("https://api.example.com", bearer("t"), null)
+    if (tr.baseUrl == "https://api.example.com") { pass("HttpTransport builds with base url") }
+    else { fail("transport", "baseUrl=" + tr.baseUrl) }
+}
+
+function main(): void {
+    println("══════════════════════════════════════════")
+    println(" chuks_connector tests")
+    println("══════════════════════════════════════════")
+    var start: any = test.now()
+
+    println("\n── Module ──")
+    testConnectorsExist()
+
+    println("\n── Credentials ──")
+    testBearerHeader()
+    testApiKeyCustomHeader()
+    testApiKeyQuery()
+    testOauthRefresh()
+
+    println("\n── Token store ──")
+    testMemoryStore()
+
+    println("\n── asTool bridge ──")
+    testGithubAsTool()
+    testGithubToolSchema()
+    testSlackAsTool()
+    testAsToolsCombines()
+
+    println("\n── New connectors ──")
+    testLinearAsTool()
+    testNotionAsTool()
+    testGoogleCalendarOAuth()
+    testGmailAsTool()
+    testDiscordAsTool()
+    testStripeAsTool()
+    testTwilioAsTool()
+    testJiraAsTool()
+    testMicrosoftAsTools()
+    testOAuthCredentialRefreshWired()
+
+    println("\n── Basic auth ──")
+    testBasicAuth()
+
+    println("\n── Permission scopes ──")
+    testScopesTagged()
+    testReadOnlyTools()
+    testSelectExclude()
+
+    println("\n── Transport ──")
+    testTransportBuilds()
+
+    println("══════════════════════════════════════════")
+    var elapsed: any = test.now() - start
+    test.report(passed, failed, failures, elapsed)
+}

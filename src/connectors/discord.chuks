@@ -1,0 +1,77 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Discord connector — typed operations over the Discord REST API (v10).
+//  Authenticate with a bot token; Discord expects `Authorization: Bot <token>`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { HttpTransport, apiKey, ApiKeyOptions, TransportOptions, ToolConfig, orInt } from "../core.chuks"
+
+export dataType DiscordQuery {
+    limit: int?        // how many messages (default 50)
+}
+
+export class DiscordConnector {
+    var _t: HttpTransport? = null
+
+    constructor(botToken: string) {
+        var keyOpts: ApiKeyOptions = { "prefix": "Bot " }
+        var cred: any = apiKey(botToken, keyOpts)
+        var topts: TransportOptions = { "userAgent": "chuks_connector-discord" }
+        this._t = new HttpTransport("https://discord.com/api/v10", cred, topts)
+    }
+
+    private _http(): HttpTransport {
+        var t: HttpTransport? = this._t
+        if (t == null) { throw "discord connector: transport not initialized" }
+        return t
+    }
+
+    // Post a message to a channel.
+    public async send(channelId: string, content: string): Task<any> {
+        return await this._http().postJson("/channels/" + channelId + "/messages", { "content": content }, null)
+    }
+
+    // Read recent messages from a channel.
+    public async messages(channelId: string, q: DiscordQuery?): Task<any> {
+        var limit: int = orInt(_dLimit(q), 50)
+        return await this._http().getJson("/channels/" + channelId + "/messages?limit=" + string(limit), null)
+    }
+
+    public asTool(): []ToolConfig {
+        var self: DiscordConnector = this
+        var out: []ToolConfig = []
+
+        out.push({
+            "name": "discord_send",
+            "scope": "write",
+            "description": "Post a message to a Discord channel.",
+            "params": {
+                "channelId": { "type": "string", "description": "Channel id", "required": true },
+                "content": { "type": "string", "description": "Message content", "required": true },
+            },
+            "fn": function(args: any): any {
+                return self.send(args["channelId"], args["content"])
+            },
+        })
+
+        out.push({
+            "name": "discord_messages",
+            "scope": "read",
+            "description": "Read recent messages from a Discord channel.",
+            "params": {
+                "channelId": { "type": "string", "description": "Channel id", "required": true },
+                "limit": { "type": "int", "description": "How many messages", "default": 50 },
+            },
+            "fn": function(args: any): any {
+                var q: DiscordQuery = { "limit": args["limit"] }
+                return self.messages(args["channelId"], q)
+            },
+        })
+
+        return out
+    }
+}
+
+function _dLimit(q: DiscordQuery?): int? {
+    if (q == null) { return null }
+    return q.limit
+}

@@ -1,0 +1,180 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  @chuks/connector
+//
+//  Pre-built, typed, authenticated connectors to external services. Auth is
+//  handled, the API is wrapped, and every connector is agent-ready: call
+//  `.asTool()` and its operations become tools for @chuks/agent. In-process,
+//  single-binary, no separate server per service.
+//
+//  Layout:
+//    core.chuks            — Credential, HttpTransport, config dataTypes, helpers
+//    connectors/github.chuks
+//    connectors/slack.chuks
+//    index.chuks (this)    — the `connectors` facade + re-exports
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Credential, HttpTransport, MemoryTokenStore, Connector, ToolConfig, ApiResult, ApiKeyOptions, OAuthOptions, TransportOptions, bearer, apiKey, oauthToken, basic } from "./core.chuks"
+import { GitHubConnector, IssueQuery } from "./connectors/github.chuks"
+import { SlackConnector, HistoryQuery } from "./connectors/slack.chuks"
+import { LinearConnector, LinearIssueQuery } from "./connectors/linear.chuks"
+import { NotionConnector, NotionSearchQuery } from "./connectors/notion.chuks"
+import { GoogleCalendarConnector, EventQuery } from "./connectors/google_calendar.chuks"
+import { GmailConnector, GmailQuery } from "./connectors/gmail.chuks"
+import { DiscordConnector, DiscordQuery } from "./connectors/discord.chuks"
+import { StripeConnector, StripeQuery } from "./connectors/stripe.chuks"
+import { TwilioConnector, TwilioQuery } from "./connectors/twilio.chuks"
+import { JiraConnector, JiraQuery } from "./connectors/jira.chuks"
+import { OutlookConnector, TeamsConnector, OneDriveConnector, MsQuery } from "./connectors/microsoft.chuks"
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Facade ─────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+// Entry point. `connectors.github(token)`, `connectors.slack(token)`, etc.
+class ConnectorsModule {
+    public github(token: string): GitHubConnector {
+        return new GitHubConnector(token)
+    }
+    public slack(token: string): SlackConnector {
+        return new SlackConnector(token)
+    }
+    public linear(token: string): LinearConnector {
+        return new LinearConnector(token)
+    }
+    public notion(token: string): NotionConnector {
+        return new NotionConnector(token)
+    }
+    // OAuth: pass an access token and an optional `refresh` callback (fn(): string)
+    // that returns a fresh token. The transport refreshes once on a 401 and retries.
+    public googleCalendar(accessToken: string, refresh: any): GoogleCalendarConnector {
+        return new GoogleCalendarConnector(accessToken, refresh)
+    }
+    // OAuth: access token + optional `refresh` callback (fn(): string).
+    public gmail(accessToken: string, refresh: any): GmailConnector {
+        return new GmailConnector(accessToken, refresh)
+    }
+    public discord(botToken: string): DiscordConnector {
+        return new DiscordConnector(botToken)
+    }
+    public stripe(secretKey: string): StripeConnector {
+        return new StripeConnector(secretKey)
+    }
+    public twilio(accountSid: string, authToken: string): TwilioConnector {
+        return new TwilioConnector(accountSid, authToken)
+    }
+    public jira(siteUrl: string, email: string, apiToken: string): JiraConnector {
+        return new JiraConnector(siteUrl, email, apiToken)
+    }
+    // Microsoft 365 (Graph): OAuth access token + optional `refresh` callback.
+    public outlook(accessToken: string, refresh: any): OutlookConnector {
+        return new OutlookConnector(accessToken, refresh)
+    }
+    public teams(accessToken: string, refresh: any): TeamsConnector {
+        return new TeamsConnector(accessToken, refresh)
+    }
+    public oneDrive(accessToken: string, refresh: any): OneDriveConnector {
+        return new OneDriveConnector(accessToken, refresh)
+    }
+}
+
+const connectors = new ConnectorsModule()
+
+// Combine the tools from several connectors into one flat list, ready for
+// `agent.create({ tools: asTools([github, slack]) })`.
+export function asTools(connectorList: []Connector): []ToolConfig {
+    var out: []ToolConfig = []
+    for (var conn of connectorList) {
+        var ts: []ToolConfig = conn.asTool()
+        for (var t of ts) { out.push(t) }
+    }
+    return out
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Permission selection (the safety lever) ────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+// Filter for which operations an agent is allowed to use. An agent that can
+// `gmail.send` or `stripe.charge` is a loaded weapon, so prefer the narrowest
+// set. `readOnly` keeps only read-scoped tools; `include`/`exclude` filter by
+// tool name.
+export dataType ToolSelect {
+    readOnly: bool?,
+    include: ([]string)?,
+    exclude: ([]string)?,
+}
+
+function _inList(name: string, names: []string): bool {
+    for (var n of names) { if (n == name) { return true } }
+    return false
+}
+
+function _keepTool(t: ToolConfig, select: ToolSelect): bool {
+    if (select.readOnly == true && t.scope != "read") { return false }
+    if (select.exclude != null && _inList(t.name, select.exclude)) { return false }
+    if (select.include != null && !_inList(t.name, select.include)) { return false }
+    return true
+}
+
+// Combine connector tools, then keep only those matching `select`.
+export function selectTools(connectorList: []Connector, select: ToolSelect?): []ToolConfig {
+    var all: []ToolConfig = asTools(connectorList)
+    if (select == null) { return all }
+    var out: []ToolConfig = []
+    for (var t of all) {
+        if (_keepTool(t, select)) { out.push(t) }
+    }
+    return out
+}
+
+// Shorthand for the most important guardrail: only the read operations. Give an
+// agent these when it should observe but never mutate external systems.
+export function readOnlyTools(connectorList: []Connector): []ToolConfig {
+    var sel: ToolSelect = { "readOnly": true }
+    return selectTools(connectorList, sel)
+}
+
+export {
+    connectors,
+    asTools,
+    selectTools,
+    readOnlyTools,
+    ToolSelect,
+    Credential,
+    HttpTransport,
+    MemoryTokenStore,
+    Connector,
+    ToolConfig,
+    ApiResult,
+    ApiKeyOptions,
+    OAuthOptions,
+    TransportOptions,
+    bearer,
+    apiKey,
+    oauthToken,
+    basic,
+    GitHubConnector,
+    IssueQuery,
+    SlackConnector,
+    HistoryQuery,
+    LinearConnector,
+    LinearIssueQuery,
+    NotionConnector,
+    NotionSearchQuery,
+    GoogleCalendarConnector,
+    EventQuery,
+    GmailConnector,
+    GmailQuery,
+    DiscordConnector,
+    DiscordQuery,
+    StripeConnector,
+    StripeQuery,
+    TwilioConnector,
+    TwilioQuery,
+    JiraConnector,
+    JiraQuery,
+    OutlookConnector,
+    TeamsConnector,
+    OneDriveConnector,
+    MsQuery,
+}

@@ -1,0 +1,106 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Google Calendar connector — typed operations over the Calendar v3 API.
+//  Authenticate with an OAuth access token, plus an optional `refresh` callback
+//  (fn(): string) that returns a fresh access token. When the API answers 401,
+//  the transport calls `refresh()` once and retries, so token rotation is
+//  invisible to the caller. Pair the initial authorization-code flow with
+//  `chuks_oauth`, then hand the access token + a refresh closure here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { HttpTransport, oauthToken, OAuthOptions, TransportOptions, ToolConfig, orInt } from "../core.chuks"
+
+export dataType EventQuery {
+    maxResults: int?   // how many events (default 10)
+    timeMin: string?   // RFC3339 lower bound, e.g. "2026-06-01T00:00:00Z"
+}
+
+export class GoogleCalendarConnector {
+    var _t: HttpTransport? = null
+
+    constructor(accessToken: string, refresh: any) {
+        var cred: any = null
+        if (refresh != null) {
+            var oauthOpts: OAuthOptions = { "refresh": refresh }
+            cred = oauthToken(accessToken, oauthOpts)
+        } else {
+            cred = oauthToken(accessToken, null)
+        }
+        var topts: TransportOptions = { "userAgent": "chuks_connector-gcal" }
+        this._t = new HttpTransport("https://www.googleapis.com/calendar/v3", cred, topts)
+    }
+
+    private _http(): HttpTransport {
+        var t: HttpTransport? = this._t
+        if (t == null) { throw "google calendar connector: transport not initialized" }
+        return t
+    }
+
+    // List upcoming events on a calendar ("primary" is the user's main one).
+    public async listEvents(calendarId: string, q: EventQuery?): Task<any> {
+        var maxR: int = orInt(_evMax(q), 10)
+        var path: string = "/calendars/" + calendarId + "/events?singleEvents=true&orderBy=startTime&maxResults=" + string(maxR)
+        var tmin: string? = _evTimeMin(q)
+        if (tmin != null) { path = path + "&timeMin=" + tmin }
+        var d: any = await this._http().getJson(path, null)
+        return d["items"]
+    }
+
+    // Create a timed event. `startISO` / `endISO` are RFC3339 timestamps.
+    public async createEvent(calendarId: string, summary: string, startISO: string, endISO: string): Task<any> {
+        var body: any = {
+            "summary": summary,
+            "start": { "dateTime": startISO },
+            "end": { "dateTime": endISO },
+        }
+        return await this._http().postJson("/calendars/" + calendarId + "/events", body, null)
+    }
+
+    public asTool(): []ToolConfig {
+        var self: GoogleCalendarConnector = this
+        var out: []ToolConfig = []
+
+        out.push({
+            "name": "gcal_list_events",
+            "scope": "read",
+            "description": "List upcoming events on a Google Calendar.",
+            "params": {
+                "calendarId": { "type": "string", "description": "Calendar id (default 'primary')", "default": "primary" },
+                "maxResults": { "type": "int", "description": "How many events", "default": 10 },
+            },
+            "fn": function(args: any): any {
+                var cal: any = args["calendarId"]
+                if (cal == null) { cal = "primary" }
+                var q: EventQuery = { "maxResults": args["maxResults"] }
+                return self.listEvents(string(cal), q)
+            },
+        })
+
+        out.push({
+            "name": "gcal_create_event",
+            "scope": "write",
+            "description": "Create a timed event on a Google Calendar.",
+            "params": {
+                "calendarId": { "type": "string", "description": "Calendar id (default 'primary')", "default": "primary" },
+                "summary": { "type": "string", "description": "Event title", "required": true },
+                "start": { "type": "string", "description": "RFC3339 start, e.g. 2026-06-10T15:00:00Z", "required": true },
+                "end": { "type": "string", "description": "RFC3339 end", "required": true },
+            },
+            "fn": function(args: any): any {
+                var cal: any = args["calendarId"]
+                if (cal == null) { cal = "primary" }
+                return self.createEvent(string(cal), args["summary"], args["start"], args["end"])
+            },
+        })
+
+        return out
+    }
+}
+
+function _evMax(q: EventQuery?): int? {
+    if (q == null) { return null }
+    return q.maxResults
+}
+function _evTimeMin(q: EventQuery?): string? {
+    if (q == null) { return null }
+    return q.timeMin
+}

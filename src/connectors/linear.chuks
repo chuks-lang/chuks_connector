@@ -1,0 +1,112 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Linear connector — typed operations over the Linear GraphQL API.
+//  Authenticate with a personal API key (sent in Authorization with no prefix).
+//  Demonstrates that the shared transport handles GraphQL just as well as REST:
+//  every operation is a POST to /graphql, and logical errors arrive in
+//  `{ "errors": [...] }` on a 200, which `_gql` surfaces as a clean throw.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { HttpTransport, apiKey, TransportOptions, ApiKeyOptions, ToolConfig, orInt } from "../core.chuks"
+import { json } from "std/json"
+
+export dataType LinearIssueQuery {
+    limit: int?        // how many issues (default 25)
+}
+
+export class LinearConnector {
+    var _t: HttpTransport? = null
+
+    constructor(token: string) {
+        // Linear personal API keys go in Authorization verbatim (no "Bearer ").
+        var opts: ApiKeyOptions = { "prefix": "" }
+        var cred: any = apiKey(token, opts)
+        var topts: TransportOptions = { "userAgent": "chuks_connector-linear" }
+        this._t = new HttpTransport("https://api.linear.app", cred, topts)
+    }
+
+    private _http(): HttpTransport {
+        var t: HttpTransport? = this._t
+        if (t == null) { throw "linear connector: transport not initialized" }
+        return t
+    }
+
+    // Run a GraphQL operation and return its `data`, raising on GraphQL errors.
+    private async _gql(query: string, variables: any): Task<any> {
+        var body: any = { "query": query }
+        if (variables != null) { body["variables"] = variables }
+        var d: any = await this._http().postJson("/graphql", body, null)
+        if (d != null && d["errors"] != null) { throw "linear graphql error: " + json.stringify(d["errors"]) }
+        return d["data"]
+    }
+
+    // List recent issues.
+    public async issues(q: LinearIssueQuery?): Task<any> {
+        var limit: int = orInt(_liLimit(q), 25)
+        var query: string = "{ issues(first: " + string(limit) + ") { nodes { id identifier title priority state { name } } } }"
+        var data: any = await this._gql(query, null)
+        return data["issues"]["nodes"]
+    }
+
+    // List teams (needed to obtain a teamId for createIssue).
+    public async teams(): Task<any> {
+        var data: any = await this._gql("{ teams { nodes { id key name } } }", null)
+        return data["teams"]["nodes"]
+    }
+
+    // Create an issue on a team.
+    public async createIssue(teamId: string, title: string, description: string): Task<any> {
+        var mutation: string = "mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier url } } }"
+        var vars: any = { "input": { "teamId": teamId, "title": title, "description": description } }
+        var data: any = await this._gql(mutation, vars)
+        return data["issueCreate"]
+    }
+
+    public asTool(): []ToolConfig {
+        var self: LinearConnector = this
+        var out: []ToolConfig = []
+
+        out.push({
+            "name": "linear_issues",
+            "scope": "read",
+            "description": "List recent issues in Linear.",
+            "params": {
+                "limit": { "type": "int", "description": "How many issues", "default": 25 },
+            },
+            "fn": function(args: any): any {
+                var q: LinearIssueQuery = { "limit": args["limit"] }
+                return self.issues(q)
+            },
+        })
+
+        out.push({
+            "name": "linear_teams",
+            "scope": "read",
+            "description": "List Linear teams (to find a teamId).",
+            "params": {},
+            "fn": function(args: any): any {
+                return self.teams()
+            },
+        })
+
+        out.push({
+            "name": "linear_create_issue",
+            "scope": "write",
+            "description": "Create a new issue on a Linear team.",
+            "params": {
+                "teamId": { "type": "string", "description": "Target team id", "required": true },
+                "title": { "type": "string", "description": "Issue title", "required": true },
+                "description": { "type": "string", "description": "Issue description (markdown)", "required": true },
+            },
+            "fn": function(args: any): any {
+                return self.createIssue(args["teamId"], args["title"], args["description"])
+            },
+        })
+
+        return out
+    }
+}
+
+function _liLimit(q: LinearIssueQuery?): int? {
+    if (q == null) { return null }
+    return q.limit
+}

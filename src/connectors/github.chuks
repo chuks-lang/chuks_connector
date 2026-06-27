@@ -1,0 +1,137 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  GitHub connector — typed operations over the GitHub REST API.
+//  Authenticate with a personal access token (or a GitHub App installation
+//  token). `repo` is "owner/name".
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { HttpTransport, bearer, TransportOptions, ToolConfig, orStr, orInt } from "../core.chuks"
+
+// Query options for listing issues / pull requests.
+export dataType IssueQuery {
+    state: string?     // "open" | "closed" | "all" (default "open")
+    limit: int?        // page size (default 30)
+}
+
+export class GitHubConnector {
+    var _t: HttpTransport? = null
+
+    constructor(token: string) {
+        var opts: TransportOptions = {
+            "userAgent": "chuks_connector-github",
+            "headers": {
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        }
+        this._t = new HttpTransport("https://api.github.com", bearer(token), opts)
+    }
+
+    // Narrow the nullable transport once, so operations stay clean.
+    private _http(): HttpTransport {
+        var t: HttpTransport? = this._t
+        if (t == null) { throw "github connector: transport not initialized" }
+        return t
+    }
+
+    // List issues for a repo.
+    public async issues(repo: string, q: IssueQuery?): Task<any> {
+        var state: string = orStr(_qState(q), "open")
+        var limit: int = orInt(_qLimit(q), 30)
+        var path: string = "/repos/" + repo + "/issues?state=" + state + "&per_page=" + string(limit)
+        return await this._http().getJson(path, null)
+    }
+
+    // Open a new issue.
+    public async createIssue(repo: string, title: string, body: string): Task<any> {
+        var payload: any = { "title": title, "body": body }
+        return await this._http().postJson("/repos/" + repo + "/issues", payload, null)
+    }
+
+    // Comment on an issue or pull request (both use the issues endpoint).
+    public async comment(repo: string, issueNumber: int, body: string): Task<any> {
+        var path: string = "/repos/" + repo + "/issues/" + string(issueNumber) + "/comments"
+        return await this._http().postJson(path, { "body": body }, null)
+    }
+
+    // List pull requests.
+    public async pullRequests(repo: string, q: IssueQuery?): Task<any> {
+        var state: string = orStr(_qState(q), "open")
+        var limit: int = orInt(_qLimit(q), 30)
+        var path: string = "/repos/" + repo + "/pulls?state=" + state + "&per_page=" + string(limit)
+        return await this._http().getJson(path, null)
+    }
+
+    // Expose the operations as @chuks/agent tools.
+    public asTool(): []ToolConfig {
+        var self: GitHubConnector = this
+        var out: []ToolConfig = []
+
+        out.push({
+            "name": "github_issues",
+            "scope": "read",
+            "description": "List issues for a GitHub repository (owner/name).",
+            "params": {
+                "repo": { "type": "string", "description": "Repository as owner/name", "required": true },
+                "state": { "type": "string", "description": "open, closed, or all", "enum": ["open", "closed", "all"], "default": "open" },
+            },
+            "fn": function(args: any): any {
+                var q: IssueQuery = { "state": args["state"] }
+                return self.issues(args["repo"], q)
+            },
+        })
+
+        out.push({
+            "name": "github_create_issue",
+            "scope": "write",
+            "description": "Open a new issue on a GitHub repository.",
+            "params": {
+                "repo": { "type": "string", "description": "Repository as owner/name", "required": true },
+                "title": { "type": "string", "description": "Issue title", "required": true },
+                "body": { "type": "string", "description": "Issue body (markdown)", "required": true },
+            },
+            "fn": function(args: any): any {
+                return self.createIssue(args["repo"], args["title"], args["body"])
+            },
+        })
+
+        out.push({
+            "name": "github_comment",
+            "scope": "write",
+            "description": "Comment on a GitHub issue or pull request by number.",
+            "params": {
+                "repo": { "type": "string", "description": "Repository as owner/name", "required": true },
+                "issueNumber": { "type": "int", "description": "Issue or PR number", "required": true },
+                "body": { "type": "string", "description": "Comment body (markdown)", "required": true },
+            },
+            "fn": function(args: any): any {
+                return self.comment(args["repo"], args["issueNumber"], args["body"])
+            },
+        })
+
+        out.push({
+            "name": "github_pull_requests",
+            "scope": "read",
+            "description": "List pull requests for a GitHub repository.",
+            "params": {
+                "repo": { "type": "string", "description": "Repository as owner/name", "required": true },
+                "state": { "type": "string", "description": "open, closed, or all", "enum": ["open", "closed", "all"], "default": "open" },
+            },
+            "fn": function(args: any): any {
+                var q: IssueQuery = { "state": args["state"] }
+                return self.pullRequests(args["repo"], q)
+            },
+        })
+
+        return out
+    }
+}
+
+// Field accessors that tolerate a null query.
+function _qState(q: IssueQuery?): string? {
+    if (q == null) { return null }
+    return q.state
+}
+function _qLimit(q: IssueQuery?): int? {
+    if (q == null) { return null }
+    return q.limit
+}

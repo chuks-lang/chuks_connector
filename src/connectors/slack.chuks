@@ -1,0 +1,93 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Slack connector — typed operations over the Slack Web API.
+//  Authenticate with a bot token (xoxb-...). Slack returns HTTP 200 with
+//  `{ "ok": false }` on logical errors, so each method checks that flag.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { HttpTransport, bearer, TransportOptions, ToolConfig, orInt } from "../core.chuks"
+
+// Query options for reading channel history.
+export dataType HistoryQuery {
+    limit: int?        // how many messages (default 50)
+}
+
+export class SlackConnector {
+    var _t: HttpTransport? = null
+
+    constructor(token: string) {
+        var opts: TransportOptions = { "userAgent": "chuks_connector-slack" }
+        this._t = new HttpTransport("https://slack.com/api", bearer(token), opts)
+    }
+
+    private _http(): HttpTransport {
+        var t: HttpTransport? = this._t
+        if (t == null) { throw "slack connector: transport not initialized" }
+        return t
+    }
+
+    // Slack returns 200 even on logical errors; surface those as clean throws.
+    private _check(d: any): any {
+        if (d != null && d["ok"] == false) { throw "slack error: " + string(d["error"]) }
+        return d
+    }
+
+    // Post a message to a channel ("#general" or a channel id).
+    public async send(channel: string, text: string): Task<any> {
+        var d: any = await this._http().postJson("/chat.postMessage", { "channel": channel, "text": text }, null)
+        return this._check(d)
+    }
+
+    // Read recent messages from a channel.
+    public async history(channel: string, q: HistoryQuery?): Task<any> {
+        var limit: int = orInt(_hLimit(q), 50)
+        var path: string = "/conversations.history?channel=" + channel + "&limit=" + string(limit)
+        var d: any = await this._http().getJson(path, null)
+        return this._check(d)
+    }
+
+    // Add an emoji reaction to a message (channel + timestamp).
+    public async react(channel: string, timestamp: string, emoji: string): Task<any> {
+        var payload: any = { "channel": channel, "timestamp": timestamp, "name": emoji }
+        var d: any = await this._http().postJson("/reactions.add", payload, null)
+        return this._check(d)
+    }
+
+    public asTool(): []ToolConfig {
+        var self: SlackConnector = this
+        var out: []ToolConfig = []
+
+        out.push({
+            "name": "slack_send",
+            "scope": "write",
+            "description": "Post a message to a Slack channel.",
+            "params": {
+                "channel": { "type": "string", "description": "Channel name (#eng) or id", "required": true },
+                "text": { "type": "string", "description": "Message text", "required": true },
+            },
+            "fn": function(args: any): any {
+                return self.send(args["channel"], args["text"])
+            },
+        })
+
+        out.push({
+            "name": "slack_history",
+            "scope": "read",
+            "description": "Read recent messages from a Slack channel.",
+            "params": {
+                "channel": { "type": "string", "description": "Channel id", "required": true },
+                "limit": { "type": "int", "description": "How many messages", "default": 50 },
+            },
+            "fn": function(args: any): any {
+                var q: HistoryQuery = { "limit": args["limit"] }
+                return self.history(args["channel"], q)
+            },
+        })
+
+        return out
+    }
+}
+
+function _hLimit(q: HistoryQuery?): int? {
+    if (q == null) { return null }
+    return q.limit
+}

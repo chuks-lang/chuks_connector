@@ -1,0 +1,355 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  @chuks/connector — core
+//
+//  The shared layer every connector is built on: typed credentials, a normalized
+//  result, and an authenticated HTTP transport (auth + retry + refresh-on-401 +
+    //  error normalization). Connector files import from here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { http } from "std/http"
+import { json } from "std/json"
+import { strings } from "std/strings"
+import { url } from "std/url"
+import { base64 } from "std/base64"
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Config shapes (typed, nullable fields = "use the default") ──
+// ═════════════════════════════════════════════════════════════════
+
+// Placement options for an API-key credential. Any field left out keeps the
+// default (header `Authorization`, prefix `Bearer `, sent as a header).
+export dataType ApiKeyOptions {
+    header: string?     // header name to carry the key
+    prefix: string?     // value prefix (use "" for a bare key)
+    query: string?      // if set, send the key as this query param instead
+}
+
+// Options for an OAuth credential.
+export dataType OAuthOptions {
+    refresh: any        // fn(): string — returns a fresh access token on 401
+}
+
+// Tuning for the HTTP transport.
+export dataType TransportOptions {
+    userAgent: string?,
+    maxRetries: int?,
+    headers: (map[string]string)?,  // optional default headers merged into every request
+}
+
+// The shape a connector operation is exposed as to @chuks/agent. `params` is a
+// JSON-Schema-style map and `fn` is the closure the agent invokes; both are
+// intentionally dynamic. `scope` is "read" or "write" — the safety lever used to
+// give an agent read-only access (see readOnlyTools / selectTools).
+export dataType ToolConfig {
+    name: string
+    description: string
+    params: any
+    fn: any
+    scope: string       // "read" | "write" (anything not "read" is treated as a write)
+}
+
+// Every connector exposes its operations as agent tools through this contract.
+export interface Connector {
+    asTool(): []ToolConfig
+}
+
+// Normalized transport result. `ok` reflects a 2xx; `data` is the parsed JSON
+// body; `error` is a normalized message on failure.
+export dataType ApiResult {
+    ok: bool
+    status: int
+    data: any
+    error: string
+    raw: string
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Credentials ────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+// Knows how to authenticate a request: bearer tokens, API keys (header or
+    // query), and OAuth access tokens that may need refreshing.
+export class Credential {
+    var kind: string = "bearer"          // "bearer" | "apiKey" | "oauth" | "none"
+    var token: string = ""
+    var headerName: string = "Authorization"
+    var prefix: string = "Bearer "
+    var queryParam: string = ""
+    var _refresh: any = null             // fn(): string
+
+    constructor(kind: string, token: string) {
+        this.kind = kind
+        this.token = token
+    }
+
+    // Apply this credential to a headers map (mutated and returned).
+    public applyHeaders(h: map[string]string): map[string]string {
+        if (this.queryParam != "") { return h }   // auth goes in the query instead
+        if (this.kind == "none") { return h }
+        h[this.headerName] = this.prefix + this.token
+        return h
+    }
+
+    // Query-string fragment (no leading ? or &) when auth is by query param.
+    public queryAuth(): string {
+        if (this.queryParam == "") { return "" }
+        return this.queryParam + "=" + this.token
+    }
+
+    public canRefresh(): bool { return this._refresh != null }
+
+    public refresh(): bool {
+        if (this._refresh == null) { return false }
+        var fresh: any = this._refresh()
+        if (fresh == null || fresh == "") { return false }
+        this.token = string(fresh)
+        return true
+    }
+}
+
+// Bearer token (GitHub PAT, Slack bot token, any `Authorization: Bearer`).
+export function bearer(token: string): Credential {
+    return new Credential("bearer", token)
+}
+
+// HTTP Basic auth (Twilio, Jira, and many older APIs): sends
+// `Authorization: Basic base64(username:password)`.
+export function basic(username: string, password: string): Credential {
+    var c: Credential = new Credential("basic", base64.encode(username + ":" + password))
+    c.prefix = "Basic "
+    return c
+}
+
+// API key. Defaults to `Authorization: Bearer <key>`; override placement with
+// `ApiKeyOptions`.
+export function apiKey(key: string, options: ApiKeyOptions?): Credential {
+    var c: Credential = new Credential("apiKey", key)
+    if (options != null) {
+        if (options.header != null) { c.headerName = options.header }
+        if (options.prefix != null) { c.prefix = options.prefix }
+        if (options.query != null) { c.queryParam = options.query }
+    }
+    return c
+}
+
+// OAuth access token, with an optional `refresh` callback. The transport calls
+// it once on a 401 and retries, so token rotation is invisible.
+export function oauthToken(accessToken: string, options: OAuthOptions?): Credential {
+    var c: Credential = new Credential("oauth", accessToken)
+    if (options != null && options.refresh != null) { c._refresh = options.refresh }
+    return c
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Token store (pluggable persistence) ────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+// In-memory token store. The contract is `get(key)` / `set(key, value)`, so you
+// can back it with std/db or chuks_redis without changing connector code.
+export class MemoryTokenStore {
+    var _data: map[string]any = {}
+    public get(key: string): any { return this._data[key] }
+    public set(key: string, value: any): void { this._data[key] = value }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Helpers ────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+// Pull a human message out of a parsed error body across common API shapes.
+function _extractError(status: int, data: any, raw: string): string {
+    if (data != null) {
+        var m: any = data["message"]
+        if (m != null) { return string(m) }
+        var e: any = data["error"]
+        if (e != null) {
+            var em: any = e["message"]
+            if (em != null) { return string(em) }
+            return string(e)
+        }
+        var ed: any = data["error_description"]
+        if (ed != null) { return string(ed) }
+    }
+    if (raw != null && raw != "") { return raw }
+    return "HTTP " + string(status)
+}
+
+// Return data on success, throw a clean error on failure (so @chuks/agent's
+    // tool isolation catches it).
+function _unwrap(r: ApiResult): any {
+    if (!r.ok) { throw "connector error (" + string(r.status) + "): " + r.error }
+    return r.data
+}
+
+export function orStr(v: string?, fallback: string): string {
+    if (v == null) { return fallback }
+    return v
+}
+export function orInt(v: int?, fallback: int): int {
+    if (v == null) { return fallback }
+    return v
+}
+
+function _isRetryable(status: int): bool {
+    return status == 429 || status == 500 || status == 502 || status == 503 || status == 504
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── HTTP transport (shared by every connector) ─────────────────
+// ═════════════════════════════════════════════════════════════════
+
+export class HttpTransport {
+    var baseUrl: string = ""
+    var cred: Credential? = null
+    var defaultHeaders: map[string]string = {}
+    var maxRetries: int = 2
+    var userAgent: string = "chuks_connector/0.1"
+
+    constructor(baseUrl: string, cred: Credential?, options: TransportOptions?) {
+        this.baseUrl = baseUrl
+        this.cred = cred
+        if (options != null) {
+            if (options.userAgent != null) { this.userAgent = options.userAgent }
+            if (options.maxRetries != null) { this.maxRetries = options.maxRetries }
+            if (options.headers != null) { this.defaultHeaders = options.headers }
+        }
+    }
+
+    private _url(path: string): string {
+        var full: string = this.baseUrl + path
+        var c: Credential? = this.cred
+        if (c != null) {
+            var q: string = c.queryAuth()
+            if (q != "") {
+                if (strings.contains(full, "?")) { full = full + "&" + q } else { full = full + "?" + q }
+            }
+        }
+        return full
+    }
+
+    private _headers(extra: (map[string]string)?): map[string]string {
+        var h: map[string]string = {}
+        for (var k in this.defaultHeaders) { h[k] = this.defaultHeaders[k] }
+        // Typed-map indexing returns "" (not null) on a miss, so probe presence
+        // with .get(), which yields string? — keeps a connector's custom Accept.
+        if (h.get("Accept") == null) { h["Accept"] = "application/json" }
+        if (h.get("Content-Type") == null) { h["Content-Type"] = "application/json" }
+        h["User-Agent"] = this.userAgent
+        if (extra != null) { for (var ek in extra) { h[ek] = extra[ek] } }
+        var c: Credential? = this.cred
+        if (c != null) { h = c.applyHeaders(h) }
+        return h
+    }
+
+    // One HTTP round trip with a JSON body (any JSON-able value or null).
+    public async request(method: string, path: string, body: any, extra: (map[string]string)?): Task<ApiResult> {
+        var bodyStr: string = ""
+        if (body != null) { bodyStr = json.stringify(body) }
+        return await this._send(method, path, bodyStr, extra)
+    }
+
+    // POST a form-encoded body (application/x-www-form-urlencoded). Some APIs
+    // (Stripe, Twilio, many OAuth token endpoints) require this instead of JSON.
+    public async requestForm(method: string, path: string, fields: map[string]string, extra: (map[string]string)?): Task<ApiResult> {
+        var bodyStr: string = _formEncode(fields)
+        var hdr: map[string]string = {}
+        if (extra != null) { for (var k in extra) { hdr[k] = extra[k] } }
+        hdr["Content-Type"] = "application/x-www-form-urlencoded"
+        return await this._send(method, path, bodyStr, hdr)
+    }
+
+    // The shared send loop: auth headers, transient retry, OAuth refresh on 401.
+    private async _send(method: string, path: string, bodyStr: string, extra: (map[string]string)?): Task<ApiResult> {
+        var attempt: int = 0
+        var refreshed: bool = false
+        var resp: any = null
+        var maxLoops: int = this.maxRetries + 3
+        var i: int = 0
+
+        while (i < maxLoops) {
+            i = i + 1
+            var reqUrl: string = this._url(path)
+            var headers: map[string]string = this._headers(extra)
+
+            if (method == "GET") {
+                resp = await http.get(reqUrl, headers)
+            } else {
+                resp = await http.request(method, reqUrl, bodyStr, headers)
+            }
+
+            var status: int = resp.status
+
+            // Refresh an OAuth token once on 401, then retry.
+            if (status == 401 && !refreshed) {
+                var c: Credential? = this.cred
+                if (c != null && c.canRefresh()) {
+                    refreshed = true
+                    if (c.refresh()) { continue }
+                }
+            }
+
+            // Retry transient failures.
+            if (_isRetryable(status) && attempt < this.maxRetries) {
+                attempt = attempt + 1
+                continue
+            }
+
+            return this._normalize(resp)
+        }
+        return this._normalize(resp)
+    }
+
+    private _normalize(resp: any): ApiResult {
+        var status: int = resp.status
+        var raw: string = ""
+        if (resp.body != null) { raw = resp.body }
+
+        var parsed: any = null
+        if (raw != "") {
+            try { parsed = json.parse(raw) } catch (e) { parsed = null }
+        }
+
+        if (status >= 200 && status < 300) {
+            var okRes: ApiResult = { "ok": true, "status": status, "data": parsed, "error": "", "raw": raw }
+            return okRes
+        }
+        var errRes: ApiResult = {
+            "ok": false,
+            "status": status,
+            "data": parsed,
+            "error": _extractError(status, parsed, raw),
+            "raw": raw,
+        }
+        return errRes
+    }
+
+    // ── Convenience: return parsed data or throw ──
+    public async getJson(path: string, extra: (map[string]string)?): Task<any> {
+        return _unwrap(await this.request("GET", path, null, extra))
+    }
+    public async postJson(path: string, body: any, extra: (map[string]string)?): Task<any> {
+        return _unwrap(await this.request("POST", path, body, extra))
+    }
+    public async patchJson(path: string, body: any, extra: (map[string]string)?): Task<any> {
+        return _unwrap(await this.request("PATCH", path, body, extra))
+    }
+    public async delJson(path: string, extra: (map[string]string)?): Task<any> {
+        return _unwrap(await this.request("DELETE", path, null, extra))
+    }
+    // POST a form-encoded body and return parsed JSON (most form APIs answer JSON).
+    public async postFormData(path: string, fields: map[string]string, extra: (map[string]string)?): Task<any> {
+        return _unwrap(await this.requestForm("POST", path, fields, extra))
+    }
+}
+
+// Encode a flat field map as application/x-www-form-urlencoded.
+function _formEncode(fields: map[string]string): string {
+    var out: string = ""
+    var first: bool = true
+    for (var k in fields) {
+        if (!first) { out = out + "&" }
+        out = out + url.encode(k) + "=" + url.encode(fields[k])
+        first = false
+    }
+    return out
+}
