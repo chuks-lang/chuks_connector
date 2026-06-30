@@ -25,6 +25,7 @@ import { StripeConnector, StripeQuery } from "./connectors/stripe.chuks"
 import { TwilioConnector, TwilioQuery } from "./connectors/twilio.chuks"
 import { JiraConnector, JiraQuery } from "./connectors/jira.chuks"
 import { OutlookConnector, TeamsConnector, OneDriveConnector, MsQuery } from "./connectors/microsoft.chuks"
+import { DatabaseConnector, DbOptions } from "./connectors/database.chuks"
 
 // ═════════════════════════════════════════════════════════════════
 // ─── Facade ─────────────────────────────────────────────────────
@@ -74,6 +75,24 @@ class ConnectorsModule {
     }
     public oneDrive(accessToken: string, refresh: any): OneDriveConnector {
         return new OneDriveConnector(accessToken, refresh)
+    }
+    // SQL databases over std/db. One implementation, four engines. `opts` can
+    // carry { readOnly, maxRows }. The per-engine helpers below are thin facades
+    // so each shows up as its own connector.
+    public database(driver: string, dsn: string, opts: DbOptions?): DatabaseConnector {
+        return new DatabaseConnector(driver, dsn, opts)
+    }
+    public postgres(dsn: string, opts: DbOptions?): DatabaseConnector {
+        return new DatabaseConnector("postgres", dsn, opts)
+    }
+    public mysql(dsn: string, opts: DbOptions?): DatabaseConnector {
+        return new DatabaseConnector("mysql", dsn, opts)
+    }
+    public sqlite(path: string, opts: DbOptions?): DatabaseConnector {
+        return new DatabaseConnector("sqlite", path, opts)
+    }
+    public mssql(dsn: string, opts: DbOptions?): DatabaseConnector {
+        return new DatabaseConnector("mssql", dsn, opts)
     }
 }
 
@@ -153,6 +172,8 @@ export {
     apiKey,
     oauthToken,
     basic,
+    DatabaseConnector,
+    DbOptions,
     GitHubConnector,
     IssueQuery,
     SlackConnector,

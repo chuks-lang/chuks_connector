@@ -1,6 +1,6 @@
 {
   "name": "@chuks/connector",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Pre-built, typed, authenticated connectors to external services for Chuks — auth handled, API wrapped, agent-ready via asTool(). In-process, single-binary, no separate server.",
   "entry": "src/index.chuks",
   "author": "Chuks Team",

@@ -1,0 +1,193 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Database connector — typed, capability-scoped SQL over std/db.
+//  One implementation, four SQL engines (SQLite, PostgreSQL, MySQL, MSSQL).
+//  Reads are scope "read" (SELECT-guarded, parameterized); the write tool is
+//  scope "write" so a host (e.g. Valet) can park it on an approval gate.
+//
+//  Per-engine facades (connectors.postgres/mysql/sqlite/mssql) all delegate
+//  here, so each shows up as its own connector while sharing this code.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { ToolConfig } from "../core.chuks"
+import { db, DbDriver } from "std/db"
+
+export dataType DbOptions {
+    readOnly: bool?      // register only read tools (no db_execute)
+    maxRows: int?        // cap rows returned by db_query (default 500)
+}
+
+// Normalize a driver name to one of: sqlite | postgres | mysql | mssql.
+function _canonDriver(driver: string): string {
+    var d: string = driver.toLowerCase().trim()
+    if (d == "postgres" || d == "postgresql" || d == "pg") { return "postgres" }
+    if (d == "mysql" || d == "mariadb") { return "mysql" }
+    if (d == "mssql" || d == "sqlserver" || d == "sql server") { return "mssql" }
+    return "sqlite"
+}
+
+function _driverEnumOf(d: string): any {
+    if (d == "postgres") { return DbDriver.Postgres }
+    if (d == "mysql") { return DbDriver.MySQL }
+    if (d == "mssql") { return DbDriver.MSSQL }
+    return DbDriver.Sqlite
+}
+
+// A validated identifier is safe to embed; quote it anyway to be defensive.
+function _quoteStr(s: string): string { return "'" + s.replaceAll("'", "''") + "'" }
+function _quoteIdent(s: string): string { return "\"" + s.replaceAll("\"", "\"\"") + "\"" }
+
+function _listTablesSql(driver: string): string {
+    if (driver == "postgres") {
+        return "SELECT table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema') ORDER BY table_name"
+    }
+    if (driver == "mysql") {
+        return "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name"
+    }
+    if (driver == "mssql") {
+        return "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' ORDER BY table_name"
+    }
+    return "SELECT name AS table_name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+}
+
+function _columnsSql(driver: string, table: string): string {
+    var t: string = _quoteStr(table)
+    if (driver == "mysql") {
+        return "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = " + t + " ORDER BY ordinal_position"
+    }
+    return "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = " + t + " ORDER BY ordinal_position"
+}
+
+function _argParams(args: any): []any {
+    var out: []any = []
+    if (args != null && args["params"] != null) {
+        for (var x of args["params"]) { out.push(x) }
+    }
+    return out
+}
+
+function _inList(name: string, list: any): bool {
+    for (var x of list) { if (string(x) == name) { return true } }
+    return false
+}
+
+function _cap(rows: []any, max: int): []any {
+    if (length(rows) <= max) { return rows }
+    var out: []any = []
+    var i: int = 0
+    while (i < max) { out.push(rows[i]); i = i + 1 }
+    return out
+}
+
+export class DatabaseConnector {
+    var _conn: any = null
+    var _driver: string = "sqlite"
+    var _readOnly: bool = false
+    var _maxRows: int = 500
+
+    constructor(driver: string, dsn: string, opts: DbOptions?) {
+        this._driver = _canonDriver(driver)
+        if (opts != null) {
+            if (opts.readOnly == true) { this._readOnly = true }
+            if (opts.maxRows != null && int(opts.maxRows) > 0) { this._maxRows = int(opts.maxRows) }
+        }
+        this._conn = db.open(_driverEnumOf(this._driver), dsn, {})
+    }
+
+    public driver(): string { return this._driver }
+
+    // List user tables in the database.
+    public async listTables(): Task<any> {
+        var rows: []any = db.query(this._conn, _listTablesSql(this._driver), [])
+        var out: []any = []
+        for (var r of rows) { out.push(string(r["table_name"])) }
+        return out
+    }
+
+    // Columns and types for a table (so an agent writes correct SQL).
+    public async describe(table: string): Task<any> {
+        var known: any = await this.listTables()
+        if (!_inList(table, known)) { throw "unknown table: " + table }
+        if (this._driver == "sqlite") {
+            var prows: []any = db.query(this._conn, "PRAGMA table_info(" + _quoteIdent(table) + ")", [])
+            var pcols: []any = []
+            for (var pr of prows) {
+                pcols.push({ "column": string(pr["name"]), "type": string(pr["type"]), "nullable": int(pr["notnull"]) == 0 })
+            }
+            return pcols
+        }
+        var crows: []any = db.query(this._conn, _columnsSql(this._driver, table), [])
+        var cols: []any = []
+        for (var cr of crows) {
+            cols.push({ "column": string(cr["column_name"]), "type": string(cr["data_type"]), "nullable": string(cr["is_nullable"]) == "YES" })
+        }
+        return cols
+    }
+
+    // Read-only query. Rejects anything that is not a single SELECT/WITH.
+    public async runQuery(sql: string, params: []any): Task<any> {
+        var s: string = sql.trim()
+        if (s.endsWith(";")) { s = s.slice(0, -1) }
+        if (s.includes(";")) { throw "db_query runs a single statement only." }
+        var up: string = s.trim().toUpperCase()
+        if (!(up.startsWith("SELECT") || up.startsWith("WITH"))) {
+            throw "db_query only runs read-only SELECT statements. Use db_execute for writes."
+        }
+        var rows: []any = db.query(this._conn, s, params)
+        return _cap(rows, this._maxRows)
+    }
+
+    // Writing statement (INSERT/UPDATE/DELETE/DDL).
+    public async runExecute(sql: string, params: []any): Task<any> {
+        if (this._readOnly) { throw "this database connection is read-only." }
+        return db.exec(this._conn, sql, params)
+    }
+
+    public asTool(): []ToolConfig {
+        var self: DatabaseConnector = this
+        var out: []ToolConfig = []
+
+        out.push({
+            "name": "db_list_tables",
+            "scope": "read",
+            "description": "List the tables in the connected " + self._driver + " database.",
+            "params": {},
+            "fn": function(args: any): any { return self.listTables() },
+        })
+
+        out.push({
+            "name": "db_describe_table",
+            "scope": "read",
+            "description": "List the columns and types of a table. Call this before writing a query so column names are correct.",
+            "params": {
+                "table": { "type": "string", "description": "Table name", "required": true },
+            },
+            "fn": function(args: any): any { return self.describe(string(args["table"])) },
+        })
+
+        out.push({
+            "name": "db_query",
+            "scope": "read",
+            "description": "Run a read-only SELECT query and return matching rows. Use ? placeholders for values and pass them in params (this prevents SQL injection).",
+            "params": {
+                "sql": { "type": "string", "description": "A single SELECT statement", "required": true },
+                "params": { "type": "array", "description": "Values for the ? placeholders, in order", "required": false },
+            },
+            "fn": function(args: any): any { return self.runQuery(string(args["sql"]), _argParams(args)) },
+        })
+
+        if (!this._readOnly) {
+            out.push({
+                "name": "db_execute",
+                "scope": "write",
+                "description": "Run a writing statement (INSERT, UPDATE, DELETE, or DDL). The host may require your approval before it runs. Use ? placeholders and pass values in params.",
+                "params": {
+                    "sql": { "type": "string", "description": "A single writing statement", "required": true },
+                    "params": { "type": "array", "description": "Values for the ? placeholders, in order", "required": false },
+                },
+                "fn": function(args: any): any { return self.runExecute(string(args["sql"]), _argParams(args)) },
+            })
+        }
+
+        return out
+    }
+}

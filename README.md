@@ -184,6 +184,32 @@ var files = await oneDrive.files({ "limit": 20 })
 await oneDrive.createFolder("Reports")
 ```
 
+### SQL databases — PostgreSQL, MySQL, SQLite, SQL Server
+
+One implementation over [`std/db`](https://chuks.org/stdlib/database/), four engines. Each has its own facade so it shows up as its own connector, and they all expose the same capability-scoped tools.
+
+```chuks
+var pg = connectors.postgres("postgres://user:pass@localhost:5432/app")
+// also: connectors.mysql(dsn), connectors.sqlite("./app.db"), connectors.mssql(dsn)
+// generic: connectors.database("postgres", dsn)
+
+// read-only: registers only the read tools (no db_execute)
+var ro = connectors.postgres(dsn, { "readOnly": true })
+```
+
+Tools exposed via `.asTool()`:
+
+| Tool | scope | what it does |
+| --- | --- | --- |
+| `db_list_tables` | read | list the tables in the database |
+| `db_describe_table` | read | columns and types for a table (so an agent writes correct SQL) |
+| `db_query` | read | run a **single SELECT** (rejects anything else), parameterized via `?` placeholders, row-capped |
+| `db_execute` | write | INSERT / UPDATE / DELETE / DDL |
+
+Reads are parameterized and SELECT-guarded, so an agent given only `read` tools cannot mutate. Mark a connection `readOnly` to drop `db_execute` entirely, or tag `db_execute` behind your host's approval gate (it is `scope: "write"`).
+
+Non-SQL stores (MongoDB, Redis) are separate connectors with their own operation shapes, not part of this one.
+
 ---
 
 ## Permissions — read vs write
@@ -300,6 +326,10 @@ usually just typed operation methods plus an `asTool()` manifest.
 **Communications & Messaging**
 - ✅ Twilio (SMS)
 - SendGrid · Mailgun · Postmark · Telegram · WhatsApp Business · Intercom
+
+**Databases (SQL, via `std/db`)**
+- ✅ PostgreSQL, ✅ MySQL / MariaDB, ✅ SQLite, ✅ SQL Server
+- MongoDB · Redis (separate connectors, non-SQL shapes)
 
 **Data & Storage**
 - Airtable · Google Sheets · Snowflake · BigQuery · Supabase · Dropbox · AWS S3
